@@ -80,11 +80,95 @@ def valid_evidence() -> dict:
     }
 
 
+def valid_sharded_evidence(shard_count: int = 28) -> dict:
+    payload = valid_evidence()
+    payload["version"] = 2
+    payload["tests"]["full"] = {
+        "mode": "canonical-sharded",
+        "command": "pnpm test:run:general + pnpm test:run:serialized",
+        "expected_shards": 28,
+        "received_shards": shard_count,
+        "missing_shards": max(0, 28 - shard_count),
+        "exit_code": "0" if shard_count == 28 else "1",
+        "timed_out_shards": [],
+        "shards": [
+            {
+                "id": f"shard-{index:02d}",
+                "command": "pnpm test:run:general",
+                "exit_code": "0",
+                "timed_out": False,
+                "log_present": True,
+                "log_sha256": "c" * 64,
+                "log_bytes": 1024,
+            }
+            for index in range(shard_count)
+        ],
+    }
+    return payload
+
+
 class LinuxEvidenceTests(unittest.TestCase):
     def test_valid_linux_evidence_passes(self) -> None:
         result = verify_evidence(valid_evidence(), expected_commit=COMMIT)
         self.assertTrue(result["ok"], result["problems"])
         self.assertTrue(all(result["checks"].values()))
+
+    def test_valid_sharded_evidence_passes(self) -> None:
+        result = verify_evidence(
+            valid_sharded_evidence(), expected_commit=COMMIT
+        )
+        self.assertTrue(result["ok"], result["problems"])
+        self.assertTrue(result["checks"]["full_sharded_mode"])
+        self.assertTrue(result["checks"]["full_shards_ok"])
+        self.assertEqual(result["tests"]["suite_shards"], 28)
+
+    def test_sharded_evidence_accepts_the_aggregate_job_name(self) -> None:
+        payload = valid_sharded_evidence()
+        payload["repository"]["job"] = "evidence"
+        result = verify_evidence(payload, expected_commit=COMMIT)
+        self.assertTrue(result["ok"], result["problems"])
+        self.assertTrue(result["checks"]["run_identity"])
+
+    def test_missing_sharded_result_is_rejected(self) -> None:
+        payload = valid_sharded_evidence(27)
+        result = verify_evidence(payload)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["checks"]["full_received_shards"])
+        self.assertFalse(result["checks"]["full_no_missing_shards"])
+
+    def test_sharded_timeout_is_rejected(self) -> None:
+        payload = valid_sharded_evidence()
+        payload["tests"]["full"]["shards"][3]["exit_code"] = "124"
+        payload["tests"]["full"]["shards"][3]["timed_out"] = True
+        payload["tests"]["full"]["timed_out_shards"] = ["shard-03"]
+        payload["tests"]["full"]["exit_code"] = "1"
+        result = verify_evidence(payload)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["checks"]["full_shards_ok"])
+        self.assertFalse(result["checks"]["full_no_timed_out_shards"])
+
+    def test_sharded_failure_exit_is_rejected(self) -> None:
+        payload = valid_sharded_evidence()
+        payload["tests"]["full"]["shards"][5]["exit_code"] = "1"
+        payload["tests"]["full"]["exit_code"] = "1"
+        result = verify_evidence(payload)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["checks"]["full_shards_ok"])
+
+    def test_sharded_missing_log_is_rejected(self) -> None:
+        payload = valid_sharded_evidence()
+        payload["tests"]["full"]["shards"][7]["log_present"] = False
+        payload["tests"]["full"]["shards"][7]["log_bytes"] = 0
+        result = verify_evidence(payload)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["checks"]["full_shards_ok"])
+
+    def test_sharded_wrong_count_is_rejected(self) -> None:
+        payload = valid_sharded_evidence()
+        payload["tests"]["full"]["expected_shards"] = 20
+        result = verify_evidence(payload)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["checks"]["full_expected_shards"])
 
     def test_short_expected_commit_is_accepted(self) -> None:
         result = verify_evidence(

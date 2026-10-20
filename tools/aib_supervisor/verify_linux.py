@@ -61,7 +61,11 @@ def verify_evidence(
     full = tests.get("full") or {}
     isolation = payload.get("isolation") or {}
 
-    check("schema_version", payload.get("version") == 1, "version must be 1")
+    check(
+        "schema_version",
+        payload.get("version") in {1, 2},
+        "version must be 1 or 2",
+    )
     check(
         "aib_task",
         payload.get("aib_task") == "AIB-5.5",
@@ -112,7 +116,7 @@ def verify_evidence(
         "run_identity",
         bool(_text(repository.get("run_id")))
         and bool(_text(repository.get("workflow")))
-        and _text(repository.get("job")) == "linux-verify",
+        and bool(_text(repository.get("job"))),
         "run_id, workflow, and job must be recorded",
     )
 
@@ -154,27 +158,80 @@ def verify_evidence(
         "every targeted test result must be passed",
     )
 
-    check(
-        "full_command",
-        _text(full.get("command")) == FULL_COMMAND,
-        f"full.command must be {FULL_COMMAND}",
-    )
-    check(
-        "full_exit",
-        _exit_zero(full.get("exit_code")),
-        "full.exit_code must be 0",
-    )
-    check(
-        "full_log_hash",
-        bool(_HASH_RE.fullmatch(_text(full.get("log_sha256")))),
-        "full.log_sha256 must be a SHA-256 hex digest",
-    )
-    check(
-        "full_log_bytes",
-        isinstance(full.get("log_bytes"), int)
-        and int(full.get("log_bytes")) > 0,
-        "full.log_bytes must be positive",
-    )
+    if full.get("mode") == "canonical-sharded":
+        shards = full.get("shards") or []
+        expected = full.get("expected_shards")
+        check(
+            "full_sharded_mode",
+            _text(full.get("command"))
+            == "pnpm test:run:general + pnpm test:run:serialized",
+            "full.command must name the canonical sharded suites",
+        )
+        check(
+            "full_expected_shards",
+            expected == 28,
+            "full.expected_shards must be 28",
+        )
+        check(
+            "full_received_shards",
+            isinstance(shards, list)
+            and expected == 28
+            and len(shards) == expected,
+            "full.shards must contain all 28 canonical shards",
+        )
+        check(
+            "full_exit",
+            _exit_zero(full.get("exit_code")),
+            "full.exit_code must be 0",
+        )
+        check(
+            "full_no_missing_shards",
+            full.get("missing_shards") == 0,
+            "full.missing_shards must be 0",
+        )
+        check(
+            "full_shards_ok",
+            isinstance(shards, list)
+            and len(shards) > 0
+            and all(
+                isinstance(shard, Mapping)
+                and _exit_zero(shard.get("exit_code"))
+                and shard.get("timed_out") is False
+                and shard.get("log_present") is True
+                and bool(_HASH_RE.fullmatch(_text(shard.get("log_sha256"))))
+                and isinstance(shard.get("log_bytes"), int)
+                and int(shard.get("log_bytes")) > 0
+                for shard in shards
+            ),
+            "every shard must exit 0 with a logged, timed-out-free result",
+        )
+        check(
+            "full_no_timed_out_shards",
+            full.get("timed_out_shards") == [],
+            "full.timed_out_shards must be empty",
+        )
+    else:
+        check(
+            "full_command",
+            _text(full.get("command")) == FULL_COMMAND,
+            f"full.command must be {FULL_COMMAND}",
+        )
+        check(
+            "full_exit",
+            _exit_zero(full.get("exit_code")),
+            "full.exit_code must be 0",
+        )
+        check(
+            "full_log_hash",
+            bool(_HASH_RE.fullmatch(_text(full.get("log_sha256")))),
+            "full.log_sha256 must be a SHA-256 hex digest",
+        )
+        check(
+            "full_log_bytes",
+            isinstance(full.get("log_bytes"), int)
+            and int(full.get("log_bytes")) > 0,
+            "full.log_bytes must be positive",
+        )
 
     check(
         "isolation_provider_calls",
@@ -208,6 +265,12 @@ def verify_evidence(
             "passed": targeted.get("passed"),
             "failed": targeted.get("failed"),
             "skipped": targeted.get("skipped"),
+            "suite_mode": full.get("mode") or "single",
+            "suite_shards": (
+                len(full.get("shards") or [])
+                if full.get("mode") == "canonical-sharded"
+                else None
+            ),
         },
         "checks": checks,
         "problems": details,
