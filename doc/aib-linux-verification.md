@@ -44,7 +44,13 @@ canonical partition set.
 Every test job runs its command under GNU `timeout`, which writes the command's
 exit code to `.aib-ci/<label>.exit` before the GitHub step timeout can kill the
 runner. The log and command line are written next to it. Each job uploads its
-`.aib-ci` directory with `if: always()`.
+`.aib-ci` directory with `if: always()` and `include-hidden-files: true`. The
+flag is scoped to the dedicated `.aib-ci/` directory, which contains only the
+targeted report and the generated `.exit`, `.log`, and `.cmd` files.
+
+The test step exits with the captured status. A Vitest failure therefore marks
+its job as failed while the artifact upload and the evidence aggregator still
+run through `if: always()`.
 
 The `evidence` job downloads all artifacts with `if: always()` and runs
 `tools/aib_supervisor/ci_linux_evidence.py`. The collector always writes
@@ -55,6 +61,30 @@ contains that JSON.
 Triggers and permissions are unchanged: `workflow_dispatch` only,
 `permissions: contents: read`, no secrets, no AI providers, no Paperclip, no
 deployments, no external repository writes.
+
+## Second real run and FIX2
+
+Run `39389473679` on commit `e6b1092` executed the 19 general and 9 serialized
+partitions plus the targeted lane. All job wrappers exited 0 because the run
+step ended with `exit 0`, so only the evidence job showed a failure. The
+evidence job received zero artifacts and wrote failed evidence with
+`received_shards: 0` and `missing_shards: 28`.
+
+Two issues were found:
+
+1. `actions/upload-artifact@v4` excludes hidden files and directories by
+   default. `.aib-ci` starts with a dot, so every per-job upload found no files.
+2. The `server-02` Vitest Test Report shows `1 failure` in one test file and
+   one failed test. The shard log was written to `.aib-ci/server-02.log` and
+   was not uploaded, so the failing test name and cause cannot be recovered
+   from the existing run. This remains a Linux diagnostic pending item; no
+   test was changed or skipped.
+
+AIB-5.5.FIX2 corrects the workflow by setting `include-hidden-files: true` on
+the four artifact uploads and by returning the real test status from the three
+test steps. The artifact directories remain separate (`aib55-targeted`,
+`aib55-shard-*`, `aib55-linux-evidence`), and the evidence job still runs after
+partial failures.
 
 ## Timeouts
 

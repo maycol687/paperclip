@@ -15,6 +15,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from aib_supervisor import ci_linux_evidence as collector  # noqa: E402
+from aib_supervisor.verify_linux import verify_evidence  # noqa: E402
 
 COMMIT = "a" * 40
 
@@ -200,6 +201,41 @@ class CollectorTests(unittest.TestCase):
                 self.assertEqual(collector.main([]), 2)
         finally:
             os.chdir(previous)
+
+    def test_simulated_28_shard_success_and_failure(self) -> None:
+        self.write_targeted()
+        self.write_shards()
+        environ = {
+            "GITHUB_RUN_ID": "1",
+            "GITHUB_WORKFLOW": "AIB-5.5 Linux Verification",
+            "GITHUB_JOB": "evidence",
+        }
+        with mock.patch.object(
+            collector.platform, "system", return_value="Linux"
+        ), mock.patch.object(collector.sys, "platform", "linux"), mock.patch.object(
+            collector, "_os_name", return_value="Ubuntu 24.04.5 LTS"
+        ):
+            passed = collector.collect(self.root, environ)
+        passed_check = verify_evidence(passed, expected_commit=COMMIT)
+        self.assertEqual(passed["status"], "passed")
+        self.assertEqual(passed["tests"]["full"]["received_shards"], 28)
+        self.assertTrue(passed_check["ok"], passed_check["problems"])
+
+        (self.work / "shard-12.exit").write_text("1\n", encoding="utf-8")
+        with mock.patch.object(
+            collector.platform, "system", return_value="Linux"
+        ), mock.patch.object(collector.sys, "platform", "linux"), mock.patch.object(
+            collector, "_os_name", return_value="Ubuntu 24.04.5 LTS"
+        ):
+            failed = collector.collect(self.root, environ)
+        failed_check = verify_evidence(failed, expected_commit=COMMIT)
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("shard_exit", failed["reasons"])
+        self.assertEqual(failed["tests"]["full"]["exit_code"], "1")
+        self.assertFalse(failed_check["ok"])
+        self.assertFalse(failed_check["checks"]["status_passed"])
+        self.assertFalse(failed_check["checks"]["full_exit"])
+        self.assertFalse(failed_check["checks"]["full_shards_ok"])
 
 
 if __name__ == "__main__":
