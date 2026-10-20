@@ -54,6 +54,16 @@ import {
 
 const tempRoots: string[] = [];
 let defaultGeminiTestHome: string | undefined;
+// The remote sandbox lane runs POSIX shell scripts against a local stand-in for
+// a Linux sandbox. Windows has no `sh`, so only the tests that reach that
+// stand-in are skipped there; path, auth, SystemRoot and Gemini coverage keeps
+// running on every platform.
+const posixOnlyIt = process.platform === "win32" ? it.skip : it;
+// Every Paperclip-home fallback the engine resolves (managed Codex home, skills
+// manifest, ACP state) must land in a temp root. Without this, a test run on a
+// machine with a real ~/.paperclip instance writes into that instance's
+// companies/<id>/codex-home and fails with EPERM inside a sandbox.
+let previousPaperclipHomeForTest: string | undefined;
 
 async function makeTempRoot() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-acpx-skills-"));
@@ -61,7 +71,15 @@ async function makeTempRoot() {
   return root;
 }
 
+beforeEach(async () => {
+  previousPaperclipHomeForTest = process.env.PAPERCLIP_HOME;
+  process.env.PAPERCLIP_HOME = await makeTempRoot();
+});
+
 afterEach(async () => {
+  if (previousPaperclipHomeForTest === undefined) delete process.env.PAPERCLIP_HOME;
+  else process.env.PAPERCLIP_HOME = previousPaperclipHomeForTest;
+  previousPaperclipHomeForTest = undefined;
   defaultGeminiTestHome = undefined;
   // A remote run stages a process-session bridge whose detached event writer can
   // still be flushing a trailing event file into `.../process-sessions/<id>/events`
@@ -624,6 +642,23 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(config.shell_environment_policy.include_only).not.toContain("MY_SERVICE_TOKEN");
     expect(JSON.stringify(config)).not.toContain("assigned-run-token");
     expect(JSON.stringify(config)).not.toContain("assigned-tool-token");
+  });
+
+  it.each(["win32", "linux", "darwin"] as const)("preserves host SystemRoot only for local Windows Codex shells (%s)", async (platform) => {
+    const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+    try {
+      Object.defineProperty(process, "platform", { value: platform });
+      const { meta, result } = await runExecutor({ agent: "codex" }, {
+        agentIdentity: { keyId: "sha256:test", publicKeyPem: "public", privateKeyPem: "private" },
+      });
+      expect(result.exitCode).toBe(0);
+      const config = JSON.parse(String((meta[0]?.env as Record<string, string>).CODEX_CONFIG));
+      const keys = config.shell_environment_policy.include_only;
+      expect(keys.includes("SystemRoot")).toBe(platform === "win32");
+      expect(keys).toEqual(expect.arrayContaining(["PATH", "HOME", "LANG", "TMPDIR", "CODEX_HOME"]));
+    } finally {
+      Object.defineProperty(process, "platform", descriptor);
+    }
   });
 
   it("forwards arbitrary Codex model IDs verbatim without picker-dependent session config", async () => {
@@ -2533,7 +2568,7 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(runtimeOptions[0]!.spawnCwd).toBeUndefined();
   });
 
-  it("starts sandbox ACP process sessions in the remote execution cwd", async () => {
+  posixOnlyIt("starts sandbox ACP process sessions in the remote execution cwd", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const localCwd = path.join(root, "worktree");
@@ -2599,7 +2634,7 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(payloadEnv.PAPERCLIP_API_KEY).not.toBe("real-run-jwt");
   });
 
-  it("keeps the session fingerprint stable when only the host spawn cwd changes", async () => {
+  posixOnlyIt("keeps the session fingerprint stable when only the host spawn cwd changes", async () => {
     // `spawnCwd` (the host-only spawn redirect = the host `cwd`) must NOT enter
     // the session fingerprint or compat key: two runs of the same session that
     // stage into the same in-sandbox `remoteCwd` from DIFFERENT host worktrees
@@ -3116,6 +3151,16 @@ describe("gemini ACP flag selection", () => {
 
   async function writeFakeGemini(binDir: string, version: string) {
     await fs.mkdir(binDir, { recursive: true });
+    // Windows resolves `gemini` through PATHEXT, so the fixture has to be a
+    // .cmd shim there; the shebang script is only executable on POSIX hosts.
+    if (process.platform === "win32") {
+      await fs.writeFile(
+        path.join(binDir, "gemini.cmd"),
+        `@echo off\r\necho ${version}\r\n`,
+        "utf8",
+      );
+      return;
+    }
     const binPath = path.join(binDir, "gemini");
     await fs.writeFile(binPath, `#!/bin/sh\necho "${version}"\n`, { mode: 0o755 });
   }
@@ -3655,7 +3700,7 @@ describe("ACPX engine remote sandbox staging seam (PR 1: workspace + cwd)", () =
     return { root, stateDir, localCwd, remoteCwd, executionTarget };
   }
 
-  it("test_remote_buildRuntime_crosses_staging_seam", async () => {
+  posixOnlyIt("test_remote_buildRuntime_crosses_staging_seam", async () => {
     const { stateDir, localCwd, remoteCwd, executionTarget } = await setupRemoteSandbox();
     const { sessionInputs, events } = await runExecutor(
       { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir, cwd: localCwd },
@@ -3692,7 +3737,7 @@ describe("ACPX engine remote sandbox staging seam (PR 1: workspace + cwd)", () =
     expect(sessionInputs[0]?.cwd).toBe(remoteCwd);
   });
 
-  it("hands the merged paperclip env to the process-session launch when the setups overlap", async () => {
+  posixOnlyIt("hands the merged paperclip env to the process-session launch when the setups overlap", async () => {
     const { stateDir, localCwd, remoteCwd, executionTarget } = await setupRemoteSandbox();
     // Decode the process-session LAUNCH payload (the base64 command blob) — the
     // in-sandbox process env is carried there, NOT in the exec's own `env`.
@@ -3739,7 +3784,7 @@ describe("ACPX engine remote sandbox staging seam (PR 1: workspace + cwd)", () =
     expect(bridgeExecEnv?.PAPERCLIP_API_KEY).toBeUndefined();
   });
 
-  it("publishes referenced-project workspace hints repointed at their staged sandbox directories", async () => {
+  posixOnlyIt("publishes referenced-project workspace hints repointed at their staged sandbox directories", async () => {
     const { root, stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     // A referenced project with a real host tree, so the sandbox transport stages it and returns a
     // `project-<projectId>` directory for it.
@@ -3813,7 +3858,7 @@ describe("ACPX engine remote sandbox staging seam (PR 1: workspace + cwd)", () =
     expect(referencedHint!.cwd).not.toBe(referencedProjectDir);
   });
 
-  it("stops the process-session bridge when the paperclip bridge fails under concurrency", async () => {
+  posixOnlyIt("stops the process-session bridge when the paperclip bridge fails under concurrency", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     // The paperclip bridge fails; the process-session bridge — started CONCURRENTLY
     // with it — still resolves a live handle. The abandon path must stop that
@@ -3849,7 +3894,7 @@ describe("ACPX engine remote sandbox staging seam (PR 1: workspace + cwd)", () =
     expect(stop).toHaveBeenCalledTimes(1);
   });
 
-  it("test_remote_session_new_uses_in_sandbox_cwd", async () => {
+  posixOnlyIt("test_remote_session_new_uses_in_sandbox_cwd", async () => {
     const { stateDir, localCwd, remoteCwd, executionTarget } = await setupRemoteSandbox();
     const { sessionInputs, runtimeOptions } = await runExecutor(
       { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir, cwd: localCwd },
@@ -3863,7 +3908,7 @@ describe("ACPX engine remote sandbox staging seam (PR 1: workspace + cwd)", () =
     expect(sessionInputs[0]?.cwd).not.toBe(localCwd);
   });
 
-  it("preserves Gemini's in-sandbox workspace without host canonicalization", async () => {
+  posixOnlyIt("preserves Gemini's in-sandbox workspace without host canonicalization", async () => {
     const { stateDir, localCwd, remoteCwd, executionTarget } = await setupRemoteSandbox();
     const { sessionInputs, runtimeOptions } = await runExecutor(
       { agent: "gemini", agentCommand: "node ./fake-acp.js", stateDir, cwd: localCwd },
@@ -3873,7 +3918,7 @@ describe("ACPX engine remote sandbox staging seam (PR 1: workspace + cwd)", () =
     expect(sessionInputs[0]?.cwd).toBe(remoteCwd);
   });
 
-  it("recreates the remote runtime while resuming after the cwd is staged", async () => {
+  posixOnlyIt("recreates the remote runtime while resuming after the cwd is staged", async () => {
     const { stateDir, localCwd, remoteCwd, executionTarget } = await setupRemoteSandbox();
     const ensureInputs: Array<Record<string, unknown>> = [];
     let created = 0;
@@ -3967,7 +4012,7 @@ describe("ACPX engine remote managed-home seam (PR 2: per-adapter home seed)", (
     return { root, stateDir, localCwd, remoteCwd, executionTarget };
   }
 
-  it("test_remote_seam_receives_adapter_agnostic_context", async () => {
+  posixOnlyIt("test_remote_seam_receives_adapter_agnostic_context", async () => {
     const { stateDir, localCwd, remoteCwd, executionTarget } = await setupRemoteSandbox();
     let captured: Record<string, unknown> | null = null;
     const { sessionInputs, events } = await runExecutor(
@@ -4020,7 +4065,7 @@ describe("ACPX engine remote managed-home seam (PR 2: per-adapter home seed)", (
     expect(sessionInputs[0]?.cwd).toBe(remoteCwd);
   });
 
-  it("test_remote_seam_stages_assets_and_env_remap_reaches_process", async () => {
+  posixOnlyIt("test_remote_seam_stages_assets_and_env_remap_reaches_process", async () => {
     const { root, stateDir, localCwd, remoteCwd, executionTarget } = await setupRemoteSandbox();
     // A managed-home dir the seam ships as an asset (mirrors a per-adapter home).
     const managedHomeDir = path.join(root, "managed-home");
@@ -4061,7 +4106,7 @@ describe("ACPX engine remote managed-home seam (PR 2: per-adapter home seed)", (
     expect(path.isAbsolute(remoteAssetDir)).toBe(true);
   });
 
-  it("retains bounded restore diagnostics through real settlement and result reproduction", async () => {
+  posixOnlyIt("retains bounded restore diagnostics through real settlement and result reproduction", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const failure = Object.assign(new Error("private-restore-path and command"), { code: 1, stderr: "private-restore-stderr" });
     const { result } = await runExecutor(
@@ -4088,7 +4133,7 @@ describe("ACPX engine remote managed-home seam (PR 2: per-adapter home seed)", (
     expect(JSON.stringify(result)).not.toContain("private-restore-");
   });
 
-  it("test_remote_seam_teardown_fires_once_on_exit", async () => {
+  posixOnlyIt("test_remote_seam_teardown_fires_once_on_exit", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     let teardownCalls = 0;
     await runExecutor(
@@ -4114,7 +4159,7 @@ describe("ACPX engine remote managed-home seam (PR 2: per-adapter home seed)", (
     expect(teardownCalls).toBe(1);
   });
 
-  it("test_remote_seam_absent_stages_workspace_only", async () => {
+  posixOnlyIt("test_remote_seam_absent_stages_workspace_only", async () => {
     // Without a seam (custom agents / adapters with no home seed), the remote lane
     // stages the workspace with no home asset — byte-identical to PR-1 behavior.
     const { stateDir, localCwd, remoteCwd, executionTarget } = await setupRemoteSandbox();
@@ -4129,7 +4174,7 @@ describe("ACPX engine remote managed-home seam (PR 2: per-adapter home seed)", (
     expect(sessionInputs[0]?.cwd).toBe(remoteCwd);
   });
 
-  it("test_remote_seam_surfaces_referenced_project_staging_failure_reason", async () => {
+  posixOnlyIt("test_remote_seam_surfaces_referenced_project_staging_failure_reason", async () => {
     // A referenced project that failed to stage into the sandbox is a first-class
     // run outcome. The run result carries the failure reason for each dropped
     // project, and the run log gains one stderr line per failure that names the
@@ -4245,12 +4290,13 @@ describe("ACPX engine Claude skill bundle staging (remote ACP lane)", () => {
     const prompt = String(meta[0]?.prompt ?? "");
     expect(prompt).toContain(`- bounded: ${"x".repeat(512)} (file: `);
     expect(prompt).not.toContain("x".repeat(513));
-    expect(prompt).toMatch(/- absent \(file: .*\/absent\/SKILL\.md\)/);
-    expect(prompt).toMatch(/- malformed \(file: .*\/malformed\/SKILL\.md\)/);
+    // Separator-agnostic: the prompt lists host paths, which use "\" on Windows.
+    expect(prompt).toMatch(/- absent \(file: .*[\\/]absent[\\/]SKILL\.md\)/);
+    expect(prompt).toMatch(/- malformed \(file: .*[\\/]malformed[\\/]SKILL\.md\)/);
     for (const body of ["BOUNDED_BODY", "ABSENT_BODY", "MALFORMED_BODY"]) expect(prompt).not.toContain(body);
   });
 
-  it("rewrites the prompt and skill identity onto the in-sandbox skill root once the bundle is staged", async () => {
+  posixOnlyIt("rewrites the prompt and skill identity onto the in-sandbox skill root once the bundle is staged", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const skill = await createSkill(path.join(localCwd, "skills"), "review", "---\ndescription: Review requested task documents.\n---\n# review\nREMOTE_BODY_ONLY\n");
 
@@ -4285,7 +4331,7 @@ describe("ACPX engine Claude skill bundle staging (remote ACP lane)", () => {
     expect(skillsIdentity?.skillRoot).toBe(inSandboxSkillsRoot);
   });
 
-  it("keeps the session fingerprint stable across two different in-sandbox skill roots", async () => {
+  posixOnlyIt("keeps the session fingerprint stable across two different in-sandbox skill roots", async () => {
     // Same session (same execution target, same config) both times, so the
     // fingerprint's other 16 fields cannot explain a difference — only the
     // seam's reported in-sandbox skill path varies, by direct override.
@@ -4330,7 +4376,7 @@ describe("ACPX engine Claude skill bundle staging (remote ACP lane)", () => {
     expect(runA.result.sessionParams?.configFingerprint).toBe(runB.result.sessionParams?.configFingerprint);
   });
 
-  it("stages no skills asset and leaves the prompt untouched when no skill is selected", async () => {
+  posixOnlyIt("stages no skills asset and leaves the prompt untouched when no skill is selected", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
 
     const { meta } = await runExecutor(
@@ -4350,7 +4396,7 @@ describe("ACPX engine Claude skill bundle staging (remote ACP lane)", () => {
     expect(String(meta[0]?.prompt ?? "")).not.toContain("Skill root:");
   });
 
-  it("drops a skill that fails to materialize from the prompt, the identity, and the staged bundle", async () => {
+  posixOnlyIt("drops a skill that fails to materialize from the prompt, the identity, and the staged bundle", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const skillsRoot = path.join(localCwd, "skills");
     const review = await createSkill(skillsRoot, "review");
@@ -4395,7 +4441,7 @@ describe("ACPX engine Claude skill bundle staging (remote ACP lane)", () => {
     await expect(pathExists(path.join(hostSkillsHome, "broken"))).resolves.toBe(false);
   });
 
-  it("stages no skills asset when every selected skill fails to materialize", async () => {
+  posixOnlyIt("stages no skills asset when every selected skill fails to materialize", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const skillsRoot = path.join(localCwd, "skills");
     const linkedTarget = path.join(skillsRoot, "broken-target");
@@ -4427,7 +4473,7 @@ describe("ACPX engine Claude skill bundle staging (remote ACP lane)", () => {
     expect(String(meta[0]?.prompt ?? "")).not.toContain("Skill root:");
   });
 
-  it("drops a skill whose staged copy has no usable SKILL.md from the prompt, the identity, and the staged bundle", async () => {
+  posixOnlyIt("drops a skill whose staged copy has no usable SKILL.md from the prompt, the identity, and the staged bundle", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const skillsRoot = path.join(localCwd, "skills");
     const review = await createSkill(skillsRoot, "review");
@@ -4564,7 +4610,7 @@ describe("ACPX engine remote session-lifecycle re-staging (PR 3: stage once / re
     };
   }
 
-  it("cancels a stalled remote startup without waiting for the command or launching the provider", async () => {
+  posixOnlyIt("cancels a stalled remote startup without waiting for the command or launching the provider", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const controller = new AbortController();
     let entered!: () => void;
@@ -4621,7 +4667,7 @@ describe("ACPX engine remote session-lifecycle re-staging (PR 3: stage once / re
     expect(createRuntime).toHaveBeenCalledOnce();
   });
 
-  it("test_acp_resume_compatible_session_does_not_restage", async () => {
+  posixOnlyIt("test_acp_resume_compatible_session_does_not_restage", async () => {
     const { stateDir, localCwd, remoteCwd, executionTarget } = await setupRemoteSandbox();
     const ensureInputs: Array<Record<string, unknown>> = [];
     const execute = createAcpxEngineExecutor({
@@ -4650,7 +4696,7 @@ describe("ACPX engine remote session-lifecycle re-staging (PR 3: stage once / re
     expect(ensureInputs[1]?.resumeSessionId).toBe(first.sessionId);
   });
 
-  it("test_acp_resume_incompatible_fingerprint_stages_fresh", async () => {
+  posixOnlyIt("test_acp_resume_incompatible_fingerprint_stages_fresh", async () => {
     const { stateDir, localCwd, remoteCwd, executionTarget } = await setupRemoteSandbox();
     const ensureInputs: Array<Record<string, unknown>> = [];
     const execute = createAcpxEngineExecutor({
@@ -4682,7 +4728,7 @@ describe("ACPX engine remote session-lifecycle re-staging (PR 3: stage once / re
     expect(ensureInputs[1]?.resumeSessionId).toBeUndefined();
   });
 
-  it("test_warm_handle_scoped_per_fingerprint_no_cross_session_credential_reuse", async () => {
+  posixOnlyIt("test_warm_handle_scoped_per_fingerprint_no_cross_session_credential_reuse", async () => {
     const { root, stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const ensureInputs: Array<Record<string, unknown>> = [];
     // Two managed homes, one per session, each carrying a distinct credential
@@ -4734,7 +4780,7 @@ describe("ACPX engine remote session-lifecycle re-staging (PR 3: stage once / re
     await expect(fs.readFile(path.join(bHome, "auth.json"), "utf8")).resolves.toContain("SECRET-B");
   });
 
-  it("test_acp_failed_turn_evicts_staged_runtime_so_resume_restages", async () => {
+  posixOnlyIt("test_acp_failed_turn_evicts_staged_runtime_so_resume_restages", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const ensureInputs: Array<Record<string, unknown>> = [];
     const execute = createAcpxEngineExecutor({
@@ -4772,7 +4818,7 @@ describe("ACPX engine remote session-lifecycle re-staging (PR 3: stage once / re
   // that shares company/agent/task/fingerprint (hence sessionKey) with a prior
   // run but carries NO sessionParams starts a new ACP session — it must NOT
   // inherit the prior session's staged workspace + managed home.
-  it("test_acp_reuse_requires_compatible_resume_not_just_session_key", async () => {
+  posixOnlyIt("test_acp_reuse_requires_compatible_resume_not_just_session_key", async () => {
     const { stateDir, localCwd, remoteCwd, executionTarget } = await setupRemoteSandbox();
     const ensureInputs: Array<Record<string, unknown>> = [];
     let seamCalls = 0;
@@ -4808,7 +4854,7 @@ describe("ACPX engine remote session-lifecycle re-staging (PR 3: stage once / re
   // fire on every run (incl. a reused resume) while the one-time host staged-temp
   // cleanup must NOT fire between clean runs — otherwise the reused staged runtime
   // would be invalidated before the next resume.
-  it("test_reused_resume_copies_back_per_run_without_disposing_staged_temp", async () => {
+  posixOnlyIt("test_reused_resume_copies_back_per_run_without_disposing_staged_temp", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const ensureInputs: Array<Record<string, unknown>> = [];
     let teardownCalls = 0;
@@ -4855,7 +4901,7 @@ describe("ACPX engine remote session-lifecycle re-staging (PR 3: stage once / re
   // The one-time dispose DOES fire when the staged runtime is actually dropped
   // (here: a failed turn), releasing the host staged-temp — the copy-back also
   // still fires on the failure path.
-  it("test_dropped_staged_runtime_disposes_host_temp", async () => {
+  posixOnlyIt("test_dropped_staged_runtime_disposes_host_temp", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const ensureInputs: Array<Record<string, unknown>> = [];
     let teardownCalls = 0;
@@ -4886,7 +4932,7 @@ describe("ACPX engine remote session-lifecycle re-staging (PR 3: stage once / re
     expect(disposeCalls).toBe(1);
   });
 
-  it("test_idle_staged_runtime_cleanup_waits_for_active_turn_release", async () => {
+  posixOnlyIt("test_idle_staged_runtime_cleanup_waits_for_active_turn_release", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const events: string[] = [];
     let currentNow = 0;
@@ -4974,7 +5020,7 @@ describe("ACPX engine remote session-lifecycle re-staging (PR 3: stage once / re
   // Superseding an incompatible session that collides on sessionKey re-stages
   // fresh AND releases the superseded entry's host staged-temp (no leak, no
   // reuse of the old session's staged credentials).
-  it("test_incompatible_restage_disposes_superseded_staged_temp", async () => {
+  posixOnlyIt("test_incompatible_restage_disposes_superseded_staged_temp", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const ensureInputs: Array<Record<string, unknown>> = [];
     const disposedRunIds: string[] = [];
@@ -5005,7 +5051,7 @@ describe("ACPX engine remote session-lifecycle re-staging (PR 3: stage once / re
   // F5 leak window 1: a seam that throws AFTER a successful stage() must not leave
   // the fresh in-sandbox runtime behind. The engine records the staged result in
   // the stage wrapper and disposes it when the seam throws.
-  it("test_seam_throw_after_stage_disposes_fresh_staged_runtime", async () => {
+  posixOnlyIt("test_seam_throw_after_stage_disposes_fresh_staged_runtime", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const stagedRuntimes = new Map();
     let capturedRuntimeRoot: string | null = null;
@@ -5039,7 +5085,7 @@ describe("ACPX engine remote session-lifecycle re-staging (PR 3: stage once / re
   // the cached staged runtime, the rollback must remove the borrowed cache entry
   // through the same identity guard `discardStagedRuntime` uses — else a later
   // resume reuses an entry whose host staged-temp was already disposed.
-  it("test_partial_bridge_rollback_removes_borrowed_staged_entry", async () => {
+  posixOnlyIt("test_partial_bridge_rollback_removes_borrowed_staged_entry", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const ensureInputs: Array<Record<string, unknown>> = [];
     const stagedRuntimes = new Map();
@@ -5083,7 +5129,7 @@ describe("ACPX engine remote session-lifecycle re-staging (PR 3: stage once / re
   // of the same session key must not ship into the same remote workspace at once.
   // The per-key staging lock serializes the stage-or-reuse section, so their
   // staging windows never overlap.
-  it("test_concurrent_same_session_staging_is_serialized", async () => {
+  posixOnlyIt("test_concurrent_same_session_staging_is_serialized", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const ensureInputs: Array<Record<string, unknown>> = [];
     const events: string[] = [];
@@ -5124,7 +5170,7 @@ describe("ACPX engine remote session-lifecycle re-staging (PR 3: stage once / re
   // Greptile P1 "Lock Ends Before Use": a same-session re-stage must wait for
   // the prior run's active turn and cleanup to finish before it can touch the
   // staged remote workspace again.
-  it("test_concurrent_same_session_staging_waits_for_active_turn_cleanup", async () => {
+  posixOnlyIt("test_concurrent_same_session_staging_waits_for_active_turn_cleanup", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const events: string[] = [];
     let releaseTurn!: () => void;
@@ -5188,7 +5234,7 @@ describe("ACPX engine remote session-lifecycle re-staging (PR 3: stage once / re
   // otherwise the next run of the same session waits on the lease forever. Here
   // the first run's staging throws; the second run of the same session must
   // still acquire the lease and stage instead of deadlocking.
-  it("test_failed_staging_releases_lease_so_next_same_session_run_proceeds", async () => {
+  posixOnlyIt("test_failed_staging_releases_lease_so_next_same_session_run_proceeds", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const events: string[] = [];
     let failNextStaging = true;
@@ -5257,7 +5303,7 @@ describe("ACPX engine sandbox-start spans (opt-in root + child parenting)", () =
     };
   }
 
-  it("emits one root span with a child span per bring-up boundary, each parented to the root", async () => {
+  posixOnlyIt("emits one root span with a child span per bring-up boundary, each parented to the root", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const localCwd = path.join(root, "worktree");
@@ -5375,7 +5421,7 @@ describe("ACPX engine sandbox-start spans (opt-in root + child parenting)", () =
     }
   });
 
-  it("test_task_run_span_opens_and_ends_once_for_remote", async () => {
+  posixOnlyIt("test_task_run_span_opens_and_ends_once_for_remote", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const localCwd = path.join(root, "worktree");
@@ -5415,7 +5461,7 @@ describe("ACPX engine sandbox-start spans (opt-in root + child parenting)", () =
     expect(String(runSpan.attributes["paperclip.task.run.run_id"])).not.toContain("run-");
   });
 
-  it("test_sandbox_startup_parents_to_task_run", async () => {
+  posixOnlyIt("test_sandbox_startup_parents_to_task_run", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const localCwd = path.join(root, "worktree");
@@ -5469,7 +5515,7 @@ describe("ACPX engine sandbox-start spans (opt-in root + child parenting)", () =
     expect(spans).toHaveLength(0);
   });
 
-  it("test_agent_turn_span_parents_to_task_run", async () => {
+  posixOnlyIt("test_agent_turn_span_parents_to_task_run", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const localCwd = path.join(root, "worktree");
@@ -5527,7 +5573,7 @@ describe("ACPX engine sandbox-start spans (opt-in root + child parenting)", () =
     expect(spans.some((span) => span.name === "agent.turn")).toBe(false);
   });
 
-  it("test_run_parent_getter_tracks_task_run_then_turn", async () => {
+  posixOnlyIt("test_run_parent_getter_tracks_task_run_then_turn", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const localCwd = path.join(root, "worktree");
@@ -5602,7 +5648,7 @@ describe("ACPX engine sandbox-start spans (opt-in root + child parenting)", () =
     expect(postToken).toEqual({ span: taskRunSpan });
   });
 
-  it("test_root_region_exec_parents_to_sandbox_startup", async () => {
+  posixOnlyIt("test_root_region_exec_parents_to_sandbox_startup", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const localCwd = path.join(root, "worktree");
@@ -5652,7 +5698,7 @@ describe("ACPX engine sandbox-start spans (opt-in root + child parenting)", () =
     expect(execSpan!.parent).toBe(startupSpan);
   });
 
-  it("test_in_step_exec_still_parents_to_step_after_root_wrap", async () => {
+  posixOnlyIt("test_in_step_exec_still_parents_to_step_after_root_wrap", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const localCwd = path.join(root, "worktree");
@@ -5701,7 +5747,7 @@ describe("ACPX engine sandbox-start spans (opt-in root + child parenting)", () =
     expect(execSpan!.parent).not.toBe(startupSpan);
   });
 
-  it("records root wall / work / diff times and the bounded context on the root span", async () => {
+  posixOnlyIt("records root wall / work / diff times and the bounded context on the root span", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const localCwd = path.join(root, "worktree");
@@ -5745,7 +5791,7 @@ describe("ACPX engine sandbox-start spans (opt-in root + child parenting)", () =
     expect(rootSpan!.attributes).not.toHaveProperty(A.sandboxId);
   });
 
-  it("excludes the nested skills.reconcile wall time from the root work sum (no double count)", async () => {
+  posixOnlyIt("excludes the nested skills.reconcile wall time from the root work sum (no double count)", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const localCwd = path.join(root, "worktree");
@@ -5786,7 +5832,7 @@ describe("ACPX engine sandbox-start spans (opt-in root + child parenting)", () =
     expect(rootSpan!.attributes[A.rootWorkMs]).toBe(sumExceptReconcile);
   });
 
-  it("parents both concurrent bridge spans to the root (neither orphans)", async () => {
+  posixOnlyIt("parents both concurrent bridge spans to the root (neither orphans)", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const localCwd = path.join(root, "worktree");
@@ -5812,7 +5858,7 @@ describe("ACPX engine sandbox-start spans (opt-in root + child parenting)", () =
     expect(paperclip?.attributes[A.batch]).toBe(processSession?.attributes[A.batch]);
   });
 
-  it("records the handshake create-runtime and ensure-session sub-times on the acp.handshake span", async () => {
+  posixOnlyIt("records the handshake create-runtime and ensure-session sub-times on the acp.handshake span", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const localCwd = path.join(root, "worktree");
@@ -5834,7 +5880,7 @@ describe("ACPX engine sandbox-start spans (opt-in root + child parenting)", () =
     expect(handshake!.attributes[A.handshakeEnsureSessionWallMs] as number).toBeGreaterThanOrEqual(0);
   });
 
-  it("keeps every span attribute inside the closed allowlist (no command/path/id keys)", async () => {
+  posixOnlyIt("keeps every span attribute inside the closed allowlist (no command/path/id keys)", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const localCwd = path.join(root, "worktree");
@@ -5870,7 +5916,7 @@ describe("ACPX engine sandbox-start spans (opt-in root + child parenting)", () =
     }
   });
 
-  it("closes the root span with error status when the bring-up handshake fails", async () => {
+  posixOnlyIt("closes the root span with error status when the bring-up handshake fails", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const localCwd = path.join(root, "worktree");
@@ -5916,7 +5962,7 @@ describe("ACPX engine sandbox-start spans (opt-in root + child parenting)", () =
     expect(rootSpan!.status?.code).toBe(2);
   });
 
-  it("opens no span and does not throw when no trace context is injected", async () => {
+  posixOnlyIt("opens no span and does not throw when no trace context is injected", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const localCwd = path.join(root, "worktree");
@@ -5971,7 +6017,7 @@ describe("ACPX engine sandbox-start spans (opt-in root + child parenting)", () =
     expect(spans).toHaveLength(0);
   });
 
-  it("test_full_trace_tree_parents_correctly", async () => {
+  posixOnlyIt("test_full_trace_tree_parents_correctly", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const localCwd = path.join(root, "worktree");
@@ -6113,7 +6159,7 @@ describe("ACPX engine sandbox-start spans (opt-in root + child parenting)", () =
     expect(execParents.size).toBe(4);
   });
 
-  it("test_sync_back_runs_inside_sandbox_syncback_span", async () => {
+  posixOnlyIt("test_sync_back_runs_inside_sandbox_syncback_span", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const localCwd = path.join(root, "worktree");
@@ -6186,7 +6232,7 @@ describe("ACPX engine sandbox-start spans (opt-in root + child parenting)", () =
     expect(syncBackExec, "the teardown exec must parent to sandbox.syncBack").toBeTruthy();
   });
 
-  it("test_no_sandbox_exec_parents_to_http_root", async () => {
+  posixOnlyIt("test_no_sandbox_exec_parents_to_http_root", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const localCwd = path.join(root, "worktree");
@@ -6309,7 +6355,7 @@ describe("ACPX engine per-step startup timing (run.startup.step events)", () => 
     return events.filter((event) => event.eventType === "run.startup.step");
   }
 
-  it("emits a run.startup.step event for each of the 7 bring-up boundaries with numeric durationMs", async () => {
+  posixOnlyIt("emits a run.startup.step event for each of the 7 bring-up boundaries with numeric durationMs", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const localCwd = path.join(root, "worktree");
@@ -6361,7 +6407,7 @@ describe("ACPX engine per-step startup timing (run.startup.step events)", () => 
     expect(sessionEnv.DEFAULT_AUTH_REQUEST).toBe(JSON.stringify({ methodId: "api-key" }));
   });
 
-  it("emits the 5 non-codex boundaries for a custom-agent sandbox bring-up (no codex steps)", async () => {
+  posixOnlyIt("emits the 5 non-codex boundaries for a custom-agent sandbox bring-up (no codex steps)", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const localCwd = path.join(root, "worktree");
@@ -6397,7 +6443,7 @@ describe("ACPX engine per-step startup timing (run.startup.step events)", () => 
     }
   });
 
-  it("emits only the high-level fields on every startup-step payload, never the detailed timing or counts", async () => {
+  posixOnlyIt("emits only the high-level fields on every startup-step payload, never the detailed timing or counts", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const localCwd = path.join(root, "worktree");
@@ -6558,7 +6604,7 @@ describe("ACPX engine run lifecycle corrections (F1: settle every failure after 
     expect(result.summary).toContain("createRuntime boom");
   });
 
-  it("test_runtime_create_failure_stops_bridges_and_releases_staging_lease", async () => {
+  posixOnlyIt("test_runtime_create_failure_stops_bridges_and_releases_staging_lease", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const paperclipStop = vi.fn(async () => {});
     const processStop = vi.fn(async () => {});
@@ -6654,7 +6700,7 @@ describe("ACPX engine run lifecycle corrections (F1: settle every failure after 
     expect(close).toHaveBeenCalledTimes(1);
   });
 
-  it("test_sandbox_startup_span_ends_exactly_once_on_every_exit_path", async () => {
+  posixOnlyIt("test_sandbox_startup_span_ends_exactly_once_on_every_exit_path", async () => {
     // Each scenario runs a fresh remote bring-up with a recording trace and asserts
     // the one sandbox.startup span ends exactly once, whatever the exit path.
     const failingEnsure = () =>
@@ -7018,9 +7064,12 @@ describe("ACPX engine run lifecycle corrections (F3: one teardown error policy)"
     };
   }
 
-  it.each(["close_session", "stop_transport", "instruction_collection", "workspace_restore", "phase_reporting", "close_error_reporting"])(
-    "keeps %s visible while its real settlement await is stalled",
-    async (blockedPhase) => {
+  // Per-phase settlement runs through the local POSIX sandbox stand-in, so the
+  // Windows skip is applied per generated case rather than through it.each.
+  for (const blockedPhase of ["close_session", "stop_transport", "instruction_collection", "workspace_restore", "phase_reporting", "close_error_reporting"] as const)
+  posixOnlyIt(
+    `keeps ${blockedPhase} visible while its real settlement await is stalled`,
+    async () => {
       const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
       stubBridges();
       let resume!: () => void;
@@ -7075,7 +7124,7 @@ describe("ACPX engine run lifecycle corrections (F3: one teardown error policy)"
     },
   );
 
-  it("keeps the primary Stop cancellation visible until its await settles", async () => {
+  posixOnlyIt("keeps the primary Stop cancellation visible until its await settles", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     stubBridges();
     const controller = new AbortController();
@@ -7122,7 +7171,7 @@ describe("ACPX engine run lifecycle corrections (F3: one teardown error policy)"
     expect(scopes.size).toBe(0);
   });
 
-  it("test_clean_completed_remote_teardown_runs_bridge_stop_then_sync_back_then_lease_release", async () => {
+  posixOnlyIt("test_clean_completed_remote_teardown_runs_bridge_stop_then_sync_back_then_lease_release", async () => {
     // cleanupRemoteBridges (execute.ts:2306-2326) fixes the sub-order for a clean
     // exit: stop both bridges (allSettled) → run the managed-home sync-back
     // (remoteManagedHomeTeardown) → release the per-session staging lease LAST in
@@ -7241,7 +7290,7 @@ describe("ACPX engine run lifecycle corrections (F3: one teardown error policy)"
   });
 
 
-  it("collects instructions after confirmed close on a thrown provider turn, before workspace restore", async () => {
+  posixOnlyIt("collects instructions after confirmed close on a thrown provider turn, before workspace restore", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const { paperclipStops, anyStopped } = stubBridges();
     const order: string[] = [];
@@ -7260,7 +7309,7 @@ describe("ACPX engine run lifecycle corrections (F3: one teardown error policy)"
     expect(order).toEqual(["close", "collect"]);
   });
 
-  it("test_teardown_continues_after_one_teardown_step_fails", async () => {
+  posixOnlyIt("test_teardown_continues_after_one_teardown_step_fails", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const { paperclipStops, processStops, anyStopped } = stubBridges();
     const stagingLocks = new Map<string, Promise<unknown>>();
@@ -7303,7 +7352,7 @@ describe("ACPX engine run lifecycle corrections (F3: one teardown error policy)"
     ).toBe(true);
   });
 
-  it("restores managed home and releases the lease when instruction collection rejects", async () => {
+  posixOnlyIt("restores managed home and releases the lease when instruction collection rejects", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const { paperclipStops, processStops, anyStopped } = stubBridges();
     const stagingLocks = new Map<string, Promise<unknown>>();
@@ -7412,7 +7461,7 @@ describe("ACPX engine run lifecycle corrections (F3: one teardown error policy)"
     }
   });
 
-  it("test_result_emission_failure_does_not_skip_teardown", async () => {
+  posixOnlyIt("test_result_emission_failure_does_not_skip_teardown", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const { paperclipStops, processStops, anyStopped } = stubBridges();
     const stagingLocks = new Map<string, Promise<unknown>>();
@@ -7443,7 +7492,7 @@ describe("ACPX engine run lifecycle corrections (F3: one teardown error policy)"
     expect(stagingLocks.size).toBe(0);
   });
 
-  it("test_result_mapping_throw_after_close_does_not_rerun_teardown", async () => {
+  posixOnlyIt("test_result_mapping_throw_after_close_does_not_rerun_teardown", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     const { paperclipStops, processStops, stoppedCount } = stubBridges();
     let closeCount = 0;
@@ -7485,7 +7534,7 @@ describe("ACPX engine run lifecycle corrections (F3: one teardown error policy)"
     expect(stoppedCount(processStops)).toBe(1);
   });
 
-  it("test_teardown_failure_does_not_change_external_result", async () => {
+  posixOnlyIt("test_teardown_failure_does_not_change_external_result", async () => {
     const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
     stubBridges();
     const execute = createAcpxEngineExecutor({
@@ -7818,7 +7867,7 @@ describe("ACPX engine sandbox bridge run-disposition seam (fail-closed)", () => 
     } as never);
   }
 
-  it("fails a completed run when the bridge channel was lost before the completion", async () => {
+  posixOnlyIt("fails a completed run when the bridge channel was lost before the completion", async () => {
     const sandbox = await setupRemoteSandbox();
     const fake = createFakeBridgeHandle();
     // Latch the loss before the ACP terminal resolves.
@@ -7839,7 +7888,7 @@ describe("ACPX engine sandbox bridge run-disposition seam (fail-closed)", () => 
     expect(fake.readDisposition().failed).toBe(true);
   });
 
-  it("keeps a completed run a success when the channel stays live, and a later teardown loss is benign", async () => {
+  posixOnlyIt("keeps a completed run a success when the channel stays live, and a later teardown loss is benign", async () => {
     const sandbox = await setupRemoteSandbox();
     const fake = createFakeBridgeHandle();
     // No loss before the completion.
@@ -7859,7 +7908,7 @@ describe("ACPX engine sandbox bridge run-disposition seam (fail-closed)", () => 
     expect(fake.readDisposition().failed).toBe(false);
   });
 
-  it("does not let a later completion or activity clear the loss latch", async () => {
+  posixOnlyIt("does not let a later completion or activity clear the loss latch", async () => {
     const sandbox = await setupRemoteSandbox();
     const fake = createFakeBridgeHandle();
     // Latch the loss before the ACP terminal resolves.
@@ -7877,7 +7926,7 @@ describe("ACPX engine sandbox bridge run-disposition seam (fail-closed)", () => 
     expect(fake.readDisposition().lossReason).toBe("provider_exit");
   });
 
-  it("marks an orderly completion on a failed terminal so the teardown loss emits no false loss", async () => {
+  posixOnlyIt("marks an orderly completion on a failed terminal so the teardown loss emits no false loss", async () => {
     const sandbox = await setupRemoteSandbox();
     const fake = createFakeBridgeHandle();
     // The turn fails, and no channel loss ordered before the finalization.
@@ -7895,7 +7944,7 @@ describe("ACPX engine sandbox bridge run-disposition seam (fail-closed)", () => 
     expect(fake.readDisposition().failed).toBe(false);
   });
 
-  it("keeps duplex_channel_lost precedence when the loss latches before a failed terminal", async () => {
+  posixOnlyIt("keeps duplex_channel_lost precedence when the loss latches before a failed terminal", async () => {
     const sandbox = await setupRemoteSandbox();
     const fake = createFakeBridgeHandle();
     // Latch the loss before the ACP terminal resolves, and the terminal
@@ -7914,7 +7963,7 @@ describe("ACPX engine sandbox bridge run-disposition seam (fail-closed)", () => 
     expect(result.resultJson).toMatchObject({ status: "failed" });
   });
 
-  it("releases the runtime locally and places no remote close call once the duplex channel is lost", async () => {
+  posixOnlyIt("releases the runtime locally and places no remote close call once the duplex channel is lost", async () => {
     const sandbox = await setupRemoteSandbox();
     const fake = createFakeBridgeHandle();
     let closeCalls = 0;
@@ -7932,7 +7981,7 @@ describe("ACPX engine sandbox bridge run-disposition seam (fail-closed)", () => 
     expect(closeCalls).toBe(0);
   });
 
-  it("skips the remote close when the channel loses during the awaited turn-error finalization, after the settlement snapshot", async () => {
+  posixOnlyIt("skips the remote close when the channel loses during the awaited turn-error finalization, after the settlement snapshot", async () => {
     const sandbox = await setupRemoteSandbox();
     const fake = createFakeBridgeHandle();
     let closeCalls = 0;
@@ -7974,7 +8023,7 @@ describe("ACPX engine sandbox bridge run-disposition seam (fail-closed)", () => 
     expect(closeCalls).toBe(0);
   });
 
-  it("ends a pending handshake with a closed transport-lost code when the duplex channel is lost before ensureSession settles", async () => {
+  posixOnlyIt("ends a pending handshake with a closed transport-lost code when the duplex channel is lost before ensureSession settles", async () => {
     const sandbox = await setupRemoteSandbox();
     const fake = createFakeBridgeHandle();
     // `ensureSession` never settles on its own; only the guard can end it.
@@ -8008,7 +8057,7 @@ describe("ACPX engine sandbox bridge run-disposition seam (fail-closed)", () => 
     expect(result.errorCode).not.toBe("acpx_handshake_timeout");
   }, 10000);
 
-  it("aborts an in-flight turn and fails the run when the duplex channel latches a loss mid-turn", async () => {
+  posixOnlyIt("aborts an in-flight turn and fails the run when the duplex channel latches a loss mid-turn", async () => {
     const sandbox = await setupRemoteSandbox();
     const fake = createFakeBridgeHandle();
     const cancelReasons: (string | undefined)[] = [];
@@ -8038,7 +8087,7 @@ describe("ACPX engine sandbox bridge run-disposition seam (fail-closed)", () => 
     expect(result.resultJson).toMatchObject({ status: "failed" });
   }, 5000);
 
-  it("bounds the wait with a deadline when a latched loss cancel gets no agent cooperation", async () => {
+  posixOnlyIt("bounds the wait with a deadline when a latched loss cancel gets no agent cooperation", async () => {
     const sandbox = await setupRemoteSandbox();
     const fake = createFakeBridgeHandle();
     const cancelReasons: (string | undefined)[] = [];
@@ -8076,7 +8125,7 @@ describe("ACPX engine sandbox bridge run-disposition seam (fail-closed)", () => 
     expect(result.resultJson).toMatchObject({ status: "failed" });
   }, 5000);
 
-  it("awaits stream closure and the event drain before finalizing a duplex loss deadline", async () => {
+  posixOnlyIt("awaits stream closure and the event drain before finalizing a duplex loss deadline", async () => {
     const sandbox = await setupRemoteSandbox();
     const fake = createFakeBridgeHandle();
     let endEvents: (() => void) | null = null;
@@ -8135,7 +8184,7 @@ describe("ACPX engine sandbox bridge run-disposition seam (fail-closed)", () => 
     expect(result.errorCode).toBe("duplex_channel_lost");
   }, 5000);
 
-  it("does not abort or fail an already-completed run when the duplex channel loses after an orderly completion", async () => {
+  posixOnlyIt("does not abort or fail an already-completed run when the duplex channel loses after an orderly completion", async () => {
     const sandbox = await setupRemoteSandbox();
     const fake = createFakeBridgeHandle();
     const cancelReasons: (string | undefined)[] = [];
@@ -8561,7 +8610,7 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
     }
   });
 
-  it("never leaks the child stderr tail into logs or the acpx.error payload after a transport-lost guard trip", async () => {
+  posixOnlyIt("never leaks the child stderr tail into logs or the acpx.error payload after a transport-lost guard trip", async () => {
     const secretMarker = "sandbox-secret-marker-transport-4b91";
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");

@@ -1,0 +1,290 @@
+name: AIB-5.5 Linux Verification
+
+# Manual only: no push, pull_request, or schedule trigger.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-verify:
+    name: Ubuntu POSIX remote lane
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout without persisted credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install pnpm 9.15.4
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+          run_install: false
+
+      - name: Install Node.js 24.11.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.11.0"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install Python 3.12 for evidence collection
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies from the lockfile
+        timeout-minutes: 20
+        run: pnpm install --frozen-lockfile
+
+      - name: Prepare plugin build dependencies
+        timeout-minutes: 20
+        run: pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+
+      - name: Run targeted POSIX-only remote lane
+        id: targeted
+        continue-on-error: true
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p .aib-ci
+          pnpm exec vitest run packages/adapter-utils/src/acpx-engine/execute.test.ts \
+            --reporter=default \
+            --reporter=json \
+            --outputFile=.aib-ci/aib55-remote-lane.json \
+            2>&1 | tee .aib-ci/aib55-remote-lane.log
+          status=${PIPESTATUS[0]}
+          echo "exit_code=${status}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Run full Vitest suite
+        id: full
+        continue-on-error: true
+        timeout-minutes: 45
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p .aib-ci
+          pnpm test:run 2>&1 | tee .aib-ci/aib55-full-suite.log
+          status=${PIPESTATUS[0]}
+          echo "exit_code=${status}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Build structured AIB-5.5 evidence
+        id: evidence
+        shell: bash
+        env:
+          TARGETED_EXIT: ${{ steps.targeted.outputs.exit_code }}
+          FULL_EXIT: ${{ steps.full.outputs.exit_code }}
+          RUNNER_NAME_ENV: ${{ runner.name }}
+          RUNNER_OS_ENV: ${{ runner.os }}
+          RUNNER_ARCH_ENV: ${{ runner.arch }}
+          GITHUB_RUN_ID_ENV: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT_ENV: ${{ github.run_attempt }}
+          GITHUB_REF_ENV: ${{ github.ref }}
+          GITHUB_WORKFLOW_ENV: ${{ github.workflow }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import platform
+          import subprocess
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          root = Path.cwd()
+          work = root / ".aib-ci"
+          work.mkdir(exist_ok=True)
+
+
+          def version(command):
+              try:
+                  return subprocess.run(
+                      command,
+                      capture_output=True,
+                      text=True,
+                      check=True,
+                      timeout=30,
+                  ).stdout.strip()
+              except Exception:
+                  return "unknown"
+
+
+          def os_name():
+              try:
+                  for line in Path("/etc/os-release").read_text(
+                      encoding="utf-8"
+                  ).splitlines():
+                      if line.startswith("PRETTY_NAME="):
+                          return line.split("=", 1)[1].strip().strip('"')
+              except OSError:
+                  pass
+              return platform.platform()
+
+
+          report_path = work / "aib55-remote-lane.json"
+          report = {}
+          if report_path.exists():
+              try:
+                  report = json.loads(report_path.read_text(encoding="utf-8"))
+              except ValueError:
+                  report = {}
+          assertions = [
+              assertion
+              for result in report.get("testResults", [])
+              for assertion in result.get("assertionResults", [])
+          ]
+          results = [
+              {
+                  "name": item.get("fullName") or item.get("title") or "",
+                  "status": item.get("status", "unknown"),
+              }
+              for item in assertions
+          ]
+          passed = sum(1 for item in results if item["status"] == "passed")
+          failed = sum(1 for item in results if item["status"] == "failed")
+          skipped = sum(
+              1
+              for item in results
+              if item["status"] in {"pending", "skipped", "todo", "disabled"}
+          )
+          log_path = work / "aib55-full-suite.log"
+          log_bytes = log_path.read_bytes() if log_path.exists() else b""
+          targeted_exit = str(os.environ.get("TARGETED_EXIT", "")).strip()
+          full_exit = str(os.environ.get("FULL_EXIT", "")).strip()
+          try:
+              commit = subprocess.run(
+                  ["git", "rev-parse", "HEAD"],
+                  capture_output=True,
+                  text=True,
+                  check=True,
+                  timeout=30,
+              ).stdout.strip()
+          except Exception:
+              commit = ""
+          status = "passed" if (
+              targeted_exit == "0"
+              and full_exit == "0"
+              and len(results) > 0
+              and failed == 0
+              and skipped == 0
+          ) else "failed"
+          evidence = {
+              "version": 1,
+              "aib_task": "AIB-5.5",
+              "generated_at": datetime.now(timezone.utc)
+              .replace(microsecond=0)
+              .isoformat(),
+              "status": status,
+              "runner": {
+                  "os": platform.system(),
+                  "os_name": os_name(),
+                  "platform": sys.platform,
+                  "python_version": platform.python_version(),
+                  "node_version": version(["node", "--version"]),
+                  "pnpm_version": version(["pnpm", "--version"]),
+                  "runner_name": os.environ.get("RUNNER_NAME_ENV", ""),
+                  "runner_os": os.environ.get("RUNNER_OS_ENV", ""),
+                  "runner_arch": os.environ.get("RUNNER_ARCH_ENV", ""),
+              },
+              "repository": {
+                  "commit_sha": commit,
+                  "ref": os.environ.get("GITHUB_REF_ENV", ""),
+                  "workflow": os.environ.get("GITHUB_WORKFLOW_ENV", ""),
+                  "job": "linux-verify",
+                  "run_id": os.environ.get("GITHUB_RUN_ID_ENV", ""),
+                  "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT_ENV", ""),
+              },
+              "tests": {
+                  "targeted": {
+                      "file": (
+                          "packages/adapter-utils/src/acpx-engine/"
+                          "execute.test.ts"
+                      ),
+                      "command": (
+                          "pnpm exec vitest run "
+                          "packages/adapter-utils/src/acpx-engine/"
+                          "execute.test.ts"
+                      ),
+                      "exit_code": targeted_exit,
+                      "total": len(results),
+                      "passed": passed,
+                      "failed": failed,
+                      "skipped": skipped,
+                      "results": results,
+                  },
+                  "full": {
+                      "command": "pnpm test:run",
+                      "exit_code": full_exit,
+                      "log_sha256": hashlib.sha256(log_bytes).hexdigest(),
+                      "log_bytes": len(log_bytes),
+                  },
+              },
+              "isolation": {
+                  "provider_calls": 0,
+                  "paperclip_requests": 0,
+                  "external_repository_writes": 0,
+                  "secrets_used": False,
+                  "dependency_install": "pnpm install --frozen-lockfile",
+              },
+          }
+          evidence_path = work / "aib55-evidence.json"
+          evidence_path.write_text(
+              json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          summary = evidence_path.read_text(encoding="utf-8")
+          summary_path = Path(os.environ.get("GITHUB_STEP_SUMMARY", ""))
+          if summary_path:
+              with summary_path.open("a", encoding="utf-8") as handle:
+                  handle.write("### AIB-5.5 Linux evidence\n\n")
+                  handle.write(f"- status: `{status}`\n")
+                  handle.write(f"- commit: `{commit}`\n")
+                  handle.write(
+                      f"- tests: {len(results)} total, {passed} passed, "
+                      f"{failed} failed, {skipped} skipped\n"
+                  )
+                  handle.write(
+                      f"- full suite exit: `{full_exit}`, targeted exit: "
+                      f"`{targeted_exit}`\n\n"
+                  )
+                  handle.write("```json\n" + summary + "```\n")
+          with Path(os.environ["GITHUB_OUTPUT"]).open(
+              "a", encoding="utf-8"
+          ) as handle:
+              handle.write(f"evidence_ok={'1' if status == 'passed' else '0'}\n")
+          PY
+
+      - name: Upload AIB-5.5 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aib55-linux-evidence
+          path: .aib-ci/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce AIB-5.5 gate
+        if: always()
+        shell: bash
+        env:
+          TARGETED_EXIT: ${{ steps.targeted.outputs.exit_code }}
+          FULL_EXIT: ${{ steps.full.outputs.exit_code }}
+          EVIDENCE_OK: ${{ steps.evidence.outputs.evidence_ok }}
+        run: |
+          echo "targeted_exit=${TARGETED_EXIT:-missing}"
+          echo "full_exit=${FULL_EXIT:-missing}"
+          echo "evidence_ok=${EVIDENCE_OK:-missing}"
+          if [ "${TARGETED_EXIT:-missing}" != "0" ] \
+            || [ "${FULL_EXIT:-missing}" != "0" ] \
+            || [ "${EVIDENCE_OK:-missing}" != "1" ]; then
+            echo "AIB-5.5 Linux verification failed" >&2
+            exit 1
+          fi
+          echo "AIB-5.5 Linux verification passed"

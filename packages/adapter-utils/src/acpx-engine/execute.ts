@@ -912,6 +912,9 @@ function geminiAcpCommandTokens(commandShell: string): string[] | null {
   const tokens = commandShell.trim().split(/\s+/);
   const bin = tokens[0];
   if (!bin || bin.startsWith("'") || bin.startsWith('"')) return null;
+  // On Windows the probe runs through cmd, which the bin cannot quote itself;
+  // whitespace or shell metacharacters would let the path smuggle a command.
+  if (process.platform === "win32" && /[\s&|<>^"']/.test(bin)) return null;
   if (path.basename(bin) !== "gemini") return null;
   if (!tokens.includes("--acp")) return null;
   return tokens;
@@ -926,6 +929,10 @@ async function normalizeGeminiAcpCommandShell(commandShell: string, env: NodeJS.
       timeout: GEMINI_VERSION_PROBE_TIMEOUT_MS,
       encoding: "utf8",
       env,
+      // npm-installed CLIs on Windows are .cmd/@echo shims, which execFile
+      // cannot launch directly. The token guard rejects whitespace and cmd
+      // metacharacters before this point, so the extra shell cannot inject.
+      ...(process.platform === "win32" ? { shell: true } : {}),
     });
     versionParts = parseGeminiVersionParts(stdout);
   } catch {
@@ -2058,6 +2065,8 @@ async function buildRuntime(input: {
       existingConfig: env.CODEX_CONFIG,
       ...(input.ctx.agentIdentity ? { identityEnvironmentKeys: [...new Set([
         "PATH", "HOME", "LANG", "TMPDIR", "CODEX_HOME",
+        // Windows shells need the host SystemRoot for crypto and Winsock startup.
+        ...(process.platform === "win32" && !executionTargetIsRemote ? ["SystemRoot"] : []),
         "PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY",
         // Preserve Codex's default secret-name exclusions. The short-lived
         // Paperclip API token is required by the agent skill's Bash/curl calls.
