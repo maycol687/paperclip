@@ -67,6 +67,15 @@ function writeFileAtomic(filePath: string, contents: string, mode: number): void
   }
 }
 
+function removeLinkIfPresent(linkPath: string): void {
+  try {
+    // unlink removes the directory symlink itself; rm can attempt directory removal on Linux.
+    fs.unlinkSync(linkPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
 export function resolveInstallStorePaths(options: {
   paperclipHome?: string;
   homeDir?: string;
@@ -286,7 +295,7 @@ export function flipCurrentAtomic(
     hooks.beforeRename?.();
     fs.renameSync(temporaryLink, paths.currentPath);
   } finally {
-    fs.rmSync(temporaryLink, { force: true });
+    removeLinkIfPresent(temporaryLink);
   }
 }
 

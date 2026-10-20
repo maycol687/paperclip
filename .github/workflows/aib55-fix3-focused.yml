@@ -1,0 +1,92 @@
+name: AIB-5.5 FIX3 Focused Linux Verification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FIX3_EVIDENCE_DIR: .aib-fix3
+
+jobs:
+  focused-linux:
+    name: Focused FIX3 Linux tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout without persisted credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Install pnpm 9.15.4
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+          run_install: false
+      - name: Install Node.js 24.11.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.11.0"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - name: Install dependencies from the lockfile
+        timeout-minutes: 10
+        run: pnpm install --frozen-lockfile
+      - name: Prepare plugin build dependencies
+        timeout-minutes: 10
+        run: pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+      - name: Run focused FIX3 tests
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set -uo pipefail
+          mkdir -p "$FIX3_EVIDENCE_DIR"
+          overall=0
+
+          run_case() {
+            label="$1"
+            shift
+            log="$FIX3_EVIDENCE_DIR/${label}.log"
+            exit_file="$FIX3_EVIDENCE_DIR/${label}.exit"
+            command_file="$FIX3_EVIDENCE_DIR/${label}.cmd"
+
+            printf '%s\n' "$*" > "$command_file"
+            set +e
+            "$@" > "$log" 2>&1
+            status=$?
+            set -e
+
+            cat "$log"
+            printf '%s\n' "$status" > "$exit_file"
+            printf -- '- `%s`: exit `%s`\n' "$label" "$status" >> "$GITHUB_STEP_SUMMARY"
+            printf -- '- command: `%s`\n' "$*" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$status" -ne 0 ]; then
+              overall=1
+            fi
+          }
+
+          printf 'commit: %s\n' "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          printf 'node: %s\n' "$(node --version)" >> "$GITHUB_STEP_SUMMARY"
+          printf 'pnpm: %s\n' "$(pnpm --version)" >> "$GITHUB_STEP_SUMMARY"
+
+          run_case install-store-crash \
+            pnpm exec vitest run cli/src/__tests__/install-store.test.ts \
+            -t "leaves the old current payload working when interrupted before rename"
+          run_case install-store-symlink-cleanup \
+            pnpm exec vitest run cli/src/__tests__/install-store.test.ts \
+            -t "refuses symlinked rc files, unsafe shim parents, and multiply linked shims"
+          run_case distribution-plugin-catalog \
+            pnpm exec vitest run server/src/__tests__/distribution-plugin-catalog.test.ts
+
+          exit "$overall"
+      - name: Upload focused FIX3 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aib55-fix3-focused-evidence
+          path: .aib-fix3/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 7
